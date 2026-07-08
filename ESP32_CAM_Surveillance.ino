@@ -1,31 +1,20 @@
-/*
-  ESP32-CAM Surveillance — Phase 1: Live MJPEG Stream
-  Board: AI-Thinker ESP32-CAM
-
-  What this does:
-    - Connects to WiFi
-    - Initializes the camera (good quality: SVGA, high JPEG quality)
-    - Serves an MJPEG stream at:  http://<device-ip>/stream
-    - Serves a single snapshot at: http://<device-ip>/capture
-
-*/
-
 #include "esp_camera.h"
 #include "esp_http_server.h"
 #include <WiFi.h>
 #include "camera_pins.h"
 #include "arduino_secrets.h"
 
-// ---------- CONFIG ----------
+// Secrets in the secrets.h file
 const char *WIFI_SSID     = SECRET_SSID;
 const char *WIFI_PASSWORD = SECRET_PASS;
 
 // Camera quality settings (tune later; SVGA is a good quality/bandwidth balance)
 #define FRAME_SIZE     FRAMESIZE_SVGA   // 800x600. Options: QVGA, VGA, SVGA, XGA, UXGA...
 #define JPEG_QUALITY   10               // 0-63, LOWER number = HIGHER quality (10-12 is a good start)
-// -----------------------------
 
-httpd_handle_t stream_httpd = NULL;
+//two independent server instances
+httpd_handle_t stream_httpd = NULL; // serves "/stream" only its own server so it never blocks the others
+httpd_handle_t control_httpd = NULL;  // serves "/" and "/capture"
 
 static esp_err_t stream_handler(httpd_req_t *req) {
   camera_fb_t *fb = NULL;
@@ -83,27 +72,41 @@ static esp_err_t capture_handler(httpd_req_t *req) {
 
 static esp_err_t index_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html");
-  const char *html =
+  // the stream lives on a SEPARATE server/port (81) from this page (80) so that a long-running stream connection never blocks /capture requests.
+  char html[512];
+  snprintf(html, sizeof(html),
       "<html><body style='font-family:sans-serif;text-align:center'>"
       "<h2>ESP32-CAM Live Stream</h2>"
-      "<img src='/stream' style='max-width:100%;'>"
-      "<p><a href='/capture'>Take a snapshot</a></p>"
-      "</body></html>";
+      "<img src='http://%s:81/stream' style='max-width:100%%;'>"
+      "<p><a href='/capture' target='_blank'>Take a snapshot</a></p>"
+      "</body></html>", WiFi.localIP().toString().c_str());
   return httpd_resp_send(req, html, strlen(html));
 }
 
 void startCameraServer() {
-  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.server_port = 80;
+  // Control server: port 80, handles "/" and "/capture" 
+  httpd_config_t control_config = HTTPD_DEFAULT_CONFIG();
+  control_config.server_port = 80;
+  control_config.ctrl_port = 32768;
 
-  httpd_uri_t index_uri  = {"/",        HTTP_GET, index_handler,  NULL};
-  httpd_uri_t stream_uri = {"/stream",  HTTP_GET, stream_handler, NULL};
-  httpd_uri_t capture_uri= {"/capture", HTTP_GET, capture_handler,NULL};
+  httpd_uri_t index_uri   = {"/",        HTTP_GET, index_handler,   NULL};
+  httpd_uri_t capture_uri = {"/capture", HTTP_GET, capture_handler, NULL};
 
-  if (httpd_start(&stream_httpd, &config) == ESP_OK) {
-    httpd_register_uri_handler(stream_httpd, &index_uri);
+  if (httpd_start(&control_httpd, &control_config) == ESP_OK) {
+    httpd_register_uri_handler(control_httpd, &index_uri);
+    httpd_register_uri_handler(control_httpd, &capture_uri);
+  }
+
+  //  Stream server: port 81, handles "/stream" only 
+  // Kept on its own server/task so its blocking loop never starves /capture.
+  httpd_config_t stream_config = HTTPD_DEFAULT_CONFIG();
+  stream_config.server_port = 81;
+  stream_config.ctrl_port = 32769;
+
+  httpd_uri_t stream_uri = {"/stream", HTTP_GET, stream_handler, NULL};
+
+  if (httpd_start(&stream_httpd, &stream_config) == ESP_OK) {
     httpd_register_uri_handler(stream_httpd, &stream_uri);
-    httpd_register_uri_handler(stream_httpd, &capture_uri);
   }
 }
 
